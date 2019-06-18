@@ -6,7 +6,8 @@ config.py: contains all the models. Needed by almost all the scripts
 create_one_hot_seq.py: create one hot encoded sequences for all the following analyses
 
 ----
-## Step 1: Train the new top layer (regression) and get the prediction. The output file is named "cv_free_MPRA.csv" bacause the prediction was not made using cross_val_predict but predicted using the entire "neural_network,bpnet_bottleneck_feat" as input and the top layer as the model. 
+## Step 1: Train the new top layer (regression) and get the prediction. 
+The output file is named "cv_free_MPRA.csv" bacause the prediction was not made using cross_val_predict but predicted using the entire "neural_network,bpnet_bottleneck_feat" as input and the top layer as the model. 
 Snakefile_new_top_layer (requires util_cross_val.py)
 
 ----
