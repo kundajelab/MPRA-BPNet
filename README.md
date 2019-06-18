@@ -20,7 +20,5 @@ plot.py (to get spearman's correlation)
 
 ----
 ## Step 4: Run DeepLIFT and tfmodisco on the reconstructed models
-Snakefile_modisco 
-	I made some modifications to plot_weights() in modisco/visualization/viz_sequence.py:\
-		specifically, I added a name parameter, which is the name of the image generated, and plt.show() was changed to plt.savefig(name) to save the image.\
+Snakefile_modisco: I made some modifications to plot_weights() in modisco/visualization/viz_sequence.py. Specifically, I added a name parameter, which is the name of the image generated, and plt.show() was changed to plt.savefig(name) to save the image.\
 modisco_pattern_generator.py
