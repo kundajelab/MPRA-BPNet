@@ -1,0 +1,168 @@
+"""Run deeplift and modisco(only until create hdf5)"""
+from __future__ import print_function, division
+from config import model_exps
+import pandas as pd
+import numpy as np
+from basepair.utils import (kwargs_str2kwargs, flatten,
+                            read_pkl, read_json, write_pkl)
+
+
+import json
+try:
+    reload  # Python 2.7
+except NameError:
+    try:
+        from importlib import reload  # Python 3.4+
+    except ImportError:
+        from imp import reload
+
+import h5py
+import modisco
+reload(modisco)
+import modisco.backend
+reload(modisco.backend.tensorflow_backend)
+reload(modisco.backend)
+import modisco.nearest_neighbors
+reload(modisco.nearest_neighbors)
+import modisco.affinitymat
+reload(modisco.affinitymat.core)
+reload(modisco.affinitymat.transformers)
+import modisco.tfmodisco_workflow.seqlets_to_patterns
+reload(modisco.tfmodisco_workflow.seqlets_to_patterns)
+import modisco.tfmodisco_workflow.workflow
+reload(modisco.tfmodisco_workflow.workflow)
+import modisco.aggregator
+reload(modisco.aggregator)
+import modisco.cluster
+reload(modisco.cluster.core)
+reload(modisco.cluster.phenograph.core)
+reload(modisco.cluster.phenograph.cluster)
+import modisco.value_provider
+reload(modisco.value_provider)
+import modisco.core
+reload(modisco.core)
+import modisco.coordproducers
+reload(modisco.coordproducers)
+import modisco.metaclusterers
+reload(modisco.metaclusterers)
+import modisco.util
+reload(modisco.util)
+
+from collections import Counter
+from modisco.visualization import viz_sequence
+reload(viz_sequence)
+from matplotlib import pyplot as plt
+
+import modisco.affinitymat.core
+reload(modisco.affinitymat.core)
+import modisco.cluster.phenograph.core
+reload(modisco.cluster.phenograph.core)
+import modisco.cluster.phenograph.cluster
+reload(modisco.cluster.phenograph.cluster)
+import modisco.cluster.core
+reload(modisco.cluster.core)
+import modisco.aggregator
+reload(modisco.aggregator)
+
+import deepexplain.tensorflow
+from deepexplain.tensorflow.methods import DeepLIFTRescale
+from deepexplain.tensorflow import DeepExplain
+from basepair.external.deeplift.dinuc_shuffle import dinuc_shuffle
+from keras.models import load_model, Model, model_from_json
+import keras.backend as K
+import numpy as np
+import tempfile
+from concise.preprocessing import encodeDNA
+from concise.preprocessing.sequence import one_hot2string, DNA
+import pandas as pd
+from basepair.exp.chipnexus.data import(pool_bottleneck,
+                                                 gen_padded_sequence,
+                                                 syn_padded_sequence,
+                                                 )
+import json
+GPU=3
+experiments = list(model_exps.values())
+# --------------------------------------------
+rule all:
+    input:
+        metrics_dict=expand('0604_modisco/reconstruction/{exp}/MPRA/{dataset}/{data_hparams}/{model}/tfmodisco_results.hdf5',
+                              dataset=['synthetic', 'genomic'],
+                              data_hparams=['pool_size=15'],
+                              model=[
+                                  'LinearRegressor'
+                              ], exp=experiments),
+# --------------------------------------------
+
+
+rule deeplift:
+    input:
+        model='output_0604_top_layer/reconstruction/{exp}/MPRA/{dataset}/{data_hparams}/{model}/reconstructed_model.h5',
+        input_gen_npy='tidied_GEN_RPMsExpression_plusSeqs_one_hot.npy',
+	input_syn_npy='tidied_SYN_RPMsExpression_plusSeqs_one_hot.npy',
+    output:
+        hyp_con_scores='0604_modisco/reconstruction/{exp}/MPRA/{dataset}/{data_hparams}/{model}/hyp_con_scores.npy',
+        act_con_scores='0604_modisco/reconstruction/{exp}/MPRA/{dataset}/{data_hparams}/{model}/act_con_scores.npy',
+    run:
+        if wildcards.dataset == 'genomic':
+            dfs=np.load(input.input_gen_npy)
+
+        elif wildcards.dataset == 'synthetic':
+            dfs=np.load(input.input_syn_npy)
+
+        with DeepExplain(session=K.get_session()) as de:
+                    de_model=load_model(input.model)
+                    input_tensor=de_model.inputs[0]
+                    target_tensor=de_model.output
+                    attributions_fn=de.explain(
+                        'deeplift', target_tensor, input_tensor, dfs)
+                    attributions=attributions_fn(dfs)
+                    np.save(output.hyp_con_scores,attributions)
+        reshaped_attributions=np.asarray(attributions).reshape(dfs.shape)
+        pairwise_mul_sum=np.multiply(reshaped_attributions, dfs)
+        matrix_sum=np.sum(pairwise_mul_sum, axis=2)
+        shape_1=dfs.shape[0]
+        shape_2=dfs.shape[1]
+        shape=(shape_1, shape_2, 1)
+        matrix_sum=matrix_sum.reshape(shape)
+        output_matrix=np.multiply(matrix_sum, dfs)
+        np.save(output.act_con_scores,output_matrix)
+
+rule modisco:
+    input:
+        hyp_con_scores='0604_modisco/reconstruction/{exp}/MPRA/{dataset}/{data_hparams}/{model}/hyp_con_scores.npy',
+        act_con_scores='0604_modisco/reconstruction/{exp}/MPRA/{dataset}/{data_hparams}/{model}/act_con_scores.npy',
+        input_gen_npy='tidied_GEN_RPMsExpression_plusSeqs_one_hot.npy',
+	input_syn_npy='tidied_SYN_RPMsExpression_plusSeqs_one_hot.npy',
+    output:
+        modisco_results='0604_modisco/reconstruction/{exp}/MPRA/{dataset}/{data_hparams}/{model}/tfmodisco_results.hdf5',
+    
+    run:
+        if wildcards.dataset == 'genomic':
+                dfs=np.load(input.input_gen_npy)
+        elif wildcards.dataset == 'synthetic':
+                dfs=np.load(input.input_syn_npy)
+        act_scores=np.load(input.act_con_scores)
+        hyp_scores=np.load(input.hyp_con_scores)
+        hyp_scores=hyp_scores.reshape(act_scores.shape)
+
+        tfmodisco_results=modisco.tfmodisco_workflow.workflow.TfModiscoWorkflow(
+                    sliding_window_size=21,
+                    flank_size=10,
+                    target_seqlet_fdr=0.01,
+                    max_seqlets_per_metacluster=50000,
+                    min_metacluster_size_frac=0.02,
+                    seqlets_to_patterns_factory=modisco.tfmodisco_workflow.seqlets_to_patterns.TfModiscoSeqletsToPatternsFactory(
+                        trim_to_window_size=30,
+                        initial_flank_to_add=10,
+                        kmer_len=8, num_gaps=3,
+                        num_mismatches=2,
+                        final_min_cluster_size=60)
+                )(
+                task_names=["task"],
+                contrib_scores={"task": act_scores},
+                hypothetical_contribs={"task": hyp_scores},
+                one_hot=dfs)
+	print("here")
+        grp=h5py.File(output.modisco_results)
+        tfmodisco_results.save_hdf5(grp)
+

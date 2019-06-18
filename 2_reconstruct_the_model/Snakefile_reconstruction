@@ -1,0 +1,144 @@
+"""Reconstruct the MPRA model to connect the body and the new top layer"""
+from config import model_exps
+import pandas as pd
+import numpy as np
+from basepair.exp.paper import activity
+from basepair.exp.paper.activity import load_data, train_activity_model
+from basepair.config import create_tf_session
+from basepair.seqmodel import SeqModel
+from basepair.utils import (kwargs_str2kwargs, flatten,
+                            read_pkl, read_json, write_pkl)
+from gin_train.utils import write_json
+from pathlib import Path
+from keras import layers
+from keras.models import load_model, Model, Sequential
+from keras.layers import deserialize as layer_from_config
+import numpy as np
+import tensorflow as tf
+from basepair.exp.chipnexus.data import(pool_bottleneck,
+                                        gen_padded_sequence,
+                                        syn_padded_sequence,
+                                        )
+
+from concise.preprocessing import encodeDNA
+from concise.preprocessing.sequence import one_hot2string, DNA
+
+from keras.layers import Dense, Activation
+from keras import initializers
+from keras.optimizers import Adam
+from tensorflow import set_random_seed
+from keras.wrappers.scikit_learn import KerasRegressor
+from sklearn.model_selection import cross_val_predict
+from util_cross_val import *
+from keras.utils import plot_model
+import pickle
+from reconstruction_util import *
+experiments = list(model_exps.values())
+set_random_seed(1234)
+GPU = 3
+
+# --------------------------------------------
+rule all:
+    input:
+        'output_0604_top_layer/reconstruction/reconstructed_MPRA.csv',
+        metrics_dict = expand('output_0604_top_layer/reconstruction/{exp}/MPRA/{dataset}/{data_hparams}/{model}/reconstructed_LinearRegressor.metrics.json',
+                              dataset=['synthetic', 'genomic'],
+                              data_hparams=['pool_size=15'],
+                              model=[
+                                  'LinearRegressor'
+                              ], exp=experiments),
+# --------------------------------------------
+
+rule reconstruct:
+    input:
+        input_gen = '../tidied_GEN_RPMsExpression_plusSeqs',
+        input_syn = '../tidied_SYN_RPMsExpression_plusSeqs',
+        main_body = 'output_0604_top_layer/{exp}/MPRA/{dataset}/{data_hparams}/{model}/bottleneck_model.h5',
+        head = 'output_0604_top_layer/{exp}/MPRA/{dataset}/{data_hparams}/{model}/top_layer.h5',
+
+    output:
+        preds = 'output_0604_top_layer/reconstruction/{exp}/MPRA/{dataset}/{data_hparams}/{model}/reconstructed_LinearRegressor.preds.pkl',
+        output_kwargs = 'output_0604_top_layer/reconstruction/{exp}/MPRA/{dataset}/{data_hparams}/{model}/reconstructed_kwargs.json',
+        output_model = 'output_0604_top_layer/reconstruction/{exp}/MPRA/{dataset}/{data_hparams}/{model}/reconstructed_model.h5'
+    run:
+        model_name = wildcards.model
+        data_kwargs = kwargs_str2kwargs(wildcards.data_hparams)
+
+        dfs_gen = pd.read_csv(input.input_gen)
+        dfs_syn = pd.read_csv(input.input_syn)
+
+        if wildcards.dataset == 'genomic':
+            dfs = dfs_gen
+            bpnet_seq = np.load("tidied_GEN_RPMsExpression_plusSeqs_one_hot.npy")
+            #bpnet_seq = encodeDNA([gen_padded_sequence(s, "AAAGACGCG")
+                                   #for s in dfs.Sequence.str.upper()])
+        elif wildcards.dataset == 'synthetic':
+            dfs = dfs_syn
+            bpnet_seq = np.load("tidied_SYN_RPMsExpression_plusSeqs_one_hot.npy")
+            #bpnet_seq = encodeDNA([syn_padded_sequence(s, "AAAGACGCG")
+                                   #for s in dfs.Sequence.str.upper()])
+        else:
+            raise ValueError("dataset not genomic or synthetic")
+        y_true = dfs.expression_fc_log2.values
+        create_tf_session(GPU)
+        loaded_bottleneck_model = load_model(input.main_body)
+        loaded_head = load_model(input.head)
+        #github_reconstructed_model,github_btnk_model = github_model_builder(
+            #loaded_bottleneck_model, loaded_head)
+        reconstructed_model,btnk_model = model_builder(loaded_bottleneck_model, loaded_head)
+	#github_before_pool = github_btnk_model.predict(bpnet_seq)
+	#np.save("github_reconstructed_before_pool_"+str(wildcards.dataset),github_before_pool)
+	#before_pool = btnk_model.predict(bpnet_seq)
+        #np.save("reconstructed_before_pool_"+str(wildcards.dataset),before_pool)
+        y_pred = reconstructed_model.predict(bpnet_seq)
+        write_json(
+            {
+                "exp": wildcards.exp,
+                "data": wildcards.dataset,
+                "data_kwargs": data_kwargs,
+                "model": model_name,
+            }, output.output_kwargs)
+
+        write_pkl({"y_true": y_true[:, np.newaxis],
+                   "y_pred": y_pred[:, np.newaxis],
+                   "columns": [wildcards.dataset]}, output.preds)
+        reconstructed_model.save(output.output_model)
+
+rule evaluate:
+    """Evaluate the regression models
+    """
+    input:
+        preds = 'output_0604_top_layer/reconstruction/{exp}/MPRA/{dataset}/{data_hparams}/{model}/reconstructed_LinearRegressor.preds.pkl',
+    output:
+        metrics_dict = 'output_0604_top_layer/reconstruction/{exp}/MPRA/{dataset}/{data_hparams}/{model}/reconstructed_LinearRegressor.metrics.json',
+    run:
+        preds = read_pkl(input.preds)
+        from gin_train.metrics import RegressionMetrics
+        m = RegressionMetrics()
+        out = {"split": 'regressor', "metrics": dict()}
+        for i, c in enumerate(preds['columns']):
+            out['metrics'][c] = m(preds['y_true'][:, i],
+                                  preds['y_pred'][:, i])
+        write_json(out, output.metrics_dict)
+
+rule gather:
+    input:
+        metrics_dict = expand('output_0604_top_layer/reconstruction/{exp}/MPRA/{dataset}/{data_hparams}/{model}/reconstructed_LinearRegressor.metrics.json',
+                              dataset=['synthetic', 'genomic'],
+                              data_hparams=['pool_size=15'],
+                              model=[
+                                  'LinearRegressor'
+                              ], exp=experiments),
+    output:
+        table = 'output_0604_top_layer/reconstruction/reconstructed_MPRA.csv'
+    run:
+        import pandas as pd
+        outl = []
+        for json in input.metrics_dict:
+            metrics = read_json(json)
+            kwargs = read_json(os.path.join(
+                os.path.dirname(json), 'reconstructed_kwargs.json'))
+            out = flatten({**metrics, **kwargs}, "/")
+            outl.append(out)
+        # write the results to csv
+        pd.DataFrame(outl).to_csv(output.table, index=False)
